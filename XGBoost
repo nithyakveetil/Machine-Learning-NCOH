@@ -1,0 +1,156 @@
+# Clear environment
+rm(list = ls())
+
+# Load required libraries
+library(data.table)
+library(caret)
+library(xgboost)
+library(pROC)
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+
+# ================================
+# 1. Load Data
+# ================================
+
+# Replace with your input file paths
+data_raw <- read.table(
+  "Expression_matrix.txt",   # rows: genes, columns: samples
+  sep = "\t",
+  row.names = 1,
+  header = TRUE,
+  check.names = FALSE
+)
+
+metadata <- read.table(
+  "Metadata.txt",                # must include a 'Group' column
+  sep = "\t",
+  row.names = 1,
+  header = TRUE,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+# ================================
+# 2. Preprocess Data
+# ================================
+
+# Transpose so samples are rows
+data_t <- as.data.frame(t(data_raw))
+
+# Clean column names
+colnames(data_t) <- gsub("`", "", colnames(data_t))
+colnames(data_t) <- trimws(colnames(data_t))
+
+# Add group labels
+data_t$Group <- factor(metadata$Group, levels = c("Control", "Infected))
+
+# Variance filtering
+variances <- apply(data_t[, -ncol(data_t)], 2, var)
+variance_threshold <- quantile(variances, 0.3) # adjust if needed
+selected_features <- names(variances[variances > variance_threshold])
+data_filtered <- data_t[, c(selected_features, "Group")]
+
+cat("Number of features after variance filtering:",
+    length(selected_features), "\n")
+
+# ================================
+# 3. Train XGBoost Model
+# ================================
+set.seed(123)
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+model <- train(
+  Group ~ ., 
+  data = data_filtered, 
+  method = "xgbTree",
+  trControl = train_control,
+  metric = "ROC",
+  tuneLength = 7
+)
+
+print(model)
+print(model$results)
+
+# ================================
+# 4. Model Evaluation
+# ================================
+
+# Predictions and ROC
+pred <- model$pred
+roc_obj <- roc(response = pred$obs, predictor = pred$Infected)
+print(paste("Overall CV AUC:", auc(roc_obj)))
+
+# Confusion Matrix
+conf_mat <- confusionMatrix(pred$pred, pred$obs, positive = "Infected")
+print(conf_mat)
+
+# ================================
+# 5. Plots
+# ================================
+
+# ROC Curve
+roc_df <- data.frame(
+  TPR = rev(roc_obj$sensitivities),
+  FPR = rev(1 - roc_obj$specificities)
+)
+
+ggroc_plot <- ggplot(roc_df, aes(x = FPR, y = TPR)) +
+  geom_line(color = "#1B9E77", size = 1.5) +
+  geom_abline(linetype = "dashed", color = "gray60") +
+  annotate("text", x = 0.65, y = 0.1,
+           label = paste("AUC =", round(auc(roc_obj), 2)),
+           size = 5) +
+  labs(title = "ROC Curve - XGBoost Model",
+       x = "False Positive Rate (1 - Specificity)",
+       y = "True Positive Rate (Sensitivity)") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        panel.grid = element_blank())
+
+print(ggroc_plot)
+# ggsave("ROC_Curve_XGBoost.pdf", ggroc_plot, width = 6, height = 6, dpi = 600)
+
+# Confusion Matrix Heatmap
+conf_df <- as.data.frame(conf_mat$table)
+colnames(conf_df) <- c("Predicted", "Actual", "Freq")
+
+gg_conf <- ggplot(conf_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), vjust = 1.5, color = "black", size = 5) +
+  scale_fill_gradient(low = "steelblue", high = "skyblue") +
+  theme_minimal() +
+  labs(title = "Confusion Matrix", x = "Actual Class", y = "Predicted Class") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(gg_conf)
+
+# Feature Importance
+importance <- varImp(model)
+importance_df <- as.data.frame(importance$importance)
+importance_df$Feature <- rownames(importance_df)
+
+top_features <- importance_df %>%
+  arrange(desc(Overall)) %>%
+  dplyr::slice(1:20)
+
+importance_plot <- ggplot(top_features,
+                          aes(x = reorder(Feature, Overall), y = Overall)) +
+  geom_bar(stat = "identity", fill = "#D95F02") +
+  coord_flip() +
+  labs(title = "Top 20 Feature Importance - XGBoost",
+       x = "Features", y = "Importance Score") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        axis.text.y = element_text(size = 12),
+        panel.grid = element_blank())
+
+print(importance_plot)
+# ggsave("Feature_Importance_XGBoost.pdf", importance_plot, width = 7, height = 6, dpi = 600)
